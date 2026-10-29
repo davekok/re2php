@@ -2,334 +2,993 @@
 #define _RE2C_CONF_OPT_
 
 #include <stddef.h>
-#include "src/util/c99_stdint.h"
+#include <stdint.h>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
-#include "src/codegen/input_api.h"
-#include "src/dfa/dfa.h"
-#include "src/regexp/empty_class_policy.h"
+#include "src/constants.h"
 #include "src/encoding/enc.h"
+#include "src/options/symtab.h"
+#include "src/util/allocator.h"
+#include "src/util/attribute.h"
+#include "src/util/containers.h"
 #include "src/util/forbid_copy.h"
-
 
 namespace re2c {
 
+// note [constant and mutable options]
+//
+// Some options are immutable (target, output files; global switches like conditions, reuse mode,
+// storable states; support of flex syntax, etc.). These options are passed as command-line
+// arguments and never change. It is safe to read them from any program point after parsing
+// command-line arguments.
+//
+// Other options are configurable; they have block scope (may be specified anywhere inside of a
+// block and still affect the whole block). Reading mutable options of yet unparsed block is not
+// allowed because they may affect the way RE2C parses current block (RE2C would be tempted to base
+// decisions on the latest option value, which may not be the final one).
+//
+// RE2C allows to set configurations anywhere inside of a block (in the beginning, intermixed with
+// rules, in the end): they will affect the whole block anyway. Therefore it is not allowed to read
+// configurations until the whole block has been parsed. Immutable options, on the other hand, are
+// accessible for reading all the time (the parser itself depends on them).
+
+class Input;
 class Msg;
+class Warn;
+class RenderCallback;
+class Scratchbuf;
+struct StxCode;
+using StxCodes = list_t<StxCode>;
 
-enum target_t {
-    TARGET_CODE,
-    TARGET_DOT,
-    TARGET_SKELETON
+#define RE2C_SIGIL "@@"
+#define RE2C_YYFN_SEP ";"
+
+// default backend is C
+
+#ifndef RE2C_LANG
+#define RE2C_LANG Lang::C
+#endif
+
+#ifndef RE2C_PROG
+#define RE2C_PROG "re2c"
+#endif
+
+#define RE2C_CHECKED_LISTS \
+    CHECKED_LIST(supported_apis, \
+            ({"simple", "generic", "record"})) \
+    CHECKED_LIST(supported_api_styles, \
+            ({"free-form", "functions"})) \
+    CHECKED_LIST(supported_code_models, \
+            ({"goto-label", "loop-switch", "recursive-functions"})) \
+    CHECKED_LIST(supported_targets, \
+            ({"code", "dot", "skeleton"})) \
+    CHECKED_LIST(supported_features, \
+            ({"nested-ifs", "bitmaps", "computed-gotos", "case-ranges", "unsafe", "monadic", \
+                "tags", "captures", "captvars", "computed-continue"}))
+
+#define RE2C_STX_OPTS \
+    STX_OPT(bool, semicolons, false) \
+    STX_OPT(bool, backtick_quoted_strings, false) \
+    STX_OPT(bool, single_quoted_strings, false) \
+    STX_OPT(bool, indentation_sensitive, false) \
+    STX_OPT(bool, wrap_blocks_in_braces, false) \
+    STX_OPT(std::string, special_escapes, "")
+
+#define RE2C_CODE_TEMPLATES \
+    CODE_TEMPLATE(var_local, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::INIT}), ({}), ({StxLOpt::INIT}) \
+    ) \
+    CODE_TEMPLATE(var_global, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::INIT}), ({}), ({StxLOpt::INIT}) \
+    ) \
+    CODE_TEMPLATE(const_local, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::INIT}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(const_global, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::INIT}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(array_local, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::SIZE}), \
+        ({StxVarId::ROW, StxVarId::ELEM}), ({StxLOpt::CONST}) \
+    ) \
+    CODE_TEMPLATE(array_global, \
+        ({StxVarId::TYPE, StxVarId::NAME, StxVarId::SIZE}), \
+        ({StxVarId::ROW, StxVarId::ELEM}), ({StxLOpt::CONST}) \
+    ) \
+    CODE_TEMPLATE(array_elem, \
+        ({StxVarId::ARRAY, StxVarId::INDEX}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(enum, \
+        ({StxVarId::TYPE, StxVarId::INIT}), ({StxVarId::ELEM}), ({}) \
+    ) \
+    CODE_TEMPLATE(enum_elem, \
+        ({StxVarId::NAME, StxVarId::TYPE}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(assign, \
+        ({StxVarId::LHS, StxVarId::RHS}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(type_int, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(type_uint, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(type_yybm, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(type_yytarget, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(type_yyctable, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_eq, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_ne, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_lt, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_gt, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_le, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cmp_ge, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(if_then_else, \
+        ({StxVarId::COND}), ({StxVarId::BRANCH, StxVarId::STMT}), ({StxLOpt::COND, StxLOpt::MANY}) \
+    ) \
+    CODE_TEMPLATE(if_then_else_oneline, \
+        ({StxVarId::COND}), ({StxVarId::BRANCH, StxVarId::STMT}), ({StxLOpt::COND, StxLOpt::MANY}) \
+    ) \
+    CODE_TEMPLATE(switch, \
+        ({StxVarId::EXPR}), ({StxVarId::CASE}), ({}) \
+    ) \
+    CODE_TEMPLATE(switch_cases, \
+        ({}), ({StxVarId::CASE, StxVarId::STMT}), ({}) \
+    ) \
+    CODE_TEMPLATE(switch_cases_oneline, \
+        ({}), ({StxVarId::CASE, StxVarId::STMT}), ({}) \
+    ) \
+    CODE_TEMPLATE(switch_case_range, \
+        ({}), ({StxVarId::VAL}), ({StxLOpt::MANY, StxLOpt::CHAR_LITERALS}) \
+    ) \
+    CODE_TEMPLATE(switch_case_default, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(loop, \
+        ({StxVarId::LABEL, StxVarId::VAL, StxVarId::VAR}), \
+        ({StxVarId::STATE, StxVarId::STMT}), ({}) \
+    ) \
+    CODE_TEMPLATE(continue, \
+        ({StxVarId::LABEL, StxVarId::VAL, StxVarId::VAR}), \
+        ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(goto, \
+        ({StxVarId::LABEL}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cgoto, \
+        ({StxVarId::ARRAY, StxVarId::BASE, StxVarId::INDEX}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(cgoto_data, \
+        ({StxVarId::TYPE, StxVarId::LABEL, StxVarId::BASE}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(fndecl, \
+        ({StxVarId::NAME, StxVarId::TYPE, StxVarId::ARGNAME, StxVarId::ARGTYPE, StxVarId::THROW}), \
+        ({StxVarId::ARG}), ({StxLOpt::TYPE}) \
+    ) \
+    CODE_TEMPLATE(fndef, \
+        ({StxVarId::NAME, StxVarId::TYPE, StxVarId::ARGNAME, StxVarId::ARGTYPE, StxVarId::THROW}), \
+        ({StxVarId::ARG, StxVarId::STMT}), ({StxLOpt::TYPE}) \
+    ) \
+    CODE_TEMPLATE(fncall, \
+        ({StxVarId::NAME, StxVarId::RETVAL}), ({StxVarId::ARG}), \
+        ({StxLOpt::ARGS, StxLOpt::RETVAL}) \
+    ) \
+    CODE_TEMPLATE(tailcall, \
+        ({StxVarId::NAME}), ({StxVarId::ARG}), ({StxLOpt::ARGS, StxLOpt::RETVAL}) \
+    ) \
+    CODE_TEMPLATE(recursive_functions, \
+        ({StxVarId::FNDECL, StxVarId::FNDEF}), ({StxVarId::FN}), ({}) \
+    ) \
+    CODE_TEMPLATE(fingerprint, \
+        ({StxVarId::VER, StxVarId::DATE}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(line_info, \
+        ({StxVarId::LINE, StxVarId::FILE}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(abort, \
+        ({}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yydebug, \
+        ({StxVarId::DEBUG, StxVarId::STATE, StxVarId::CHAR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yypeek, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::PEEK, StxVarId::INPUT, StxVarId::CURSOR, \
+            StxVarId::RECORD}), ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yyskip, \
+        ({StxVarId::SKIP, StxVarId::CURSOR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybackup, \
+        ({StxVarId::BACKUP, StxVarId::CURSOR, StxVarId::MARKER, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybackupctx, \
+        ({StxVarId::BACKUPCTX, StxVarId::CURSOR, StxVarId::CTXMARKER, StxVarId::RECORD}), \
+        ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yyskip_yypeek, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::INPUT, StxVarId::CURSOR, StxVarId::RECORD}), \
+        ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yypeek_yyskip, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::CURSOR, StxVarId::RECORD}), \
+        ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yyskip_yybackup, \
+        ({StxVarId::CURSOR, StxVarId::MARKER, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybackup_yyskip, \
+        ({StxVarId::CURSOR, StxVarId::MARKER, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybackup_yypeek, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::INPUT, StxVarId::CURSOR, StxVarId::MARKER, \
+            StxVarId::RECORD}), ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yyskip_yybackup_yypeek, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::INPUT, StxVarId::CURSOR, StxVarId::MARKER, \
+            StxVarId::RECORD}), ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yybackup_yypeek_yyskip, \
+        ({StxVarId::CHAR, StxVarId::CTYPE, StxVarId::INPUT, StxVarId::CURSOR, StxVarId::MARKER, \
+            StxVarId::RECORD}), ({}), ({StxLOpt::CAST}) \
+    ) \
+    CODE_TEMPLATE(yyrestore, \
+        ({StxVarId::RESTORE, StxVarId::CURSOR, StxVarId::MARKER, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yyrestorectx, \
+        ({StxVarId::RESTORECTX, StxVarId::CURSOR, StxVarId::CTXMARKER, StxVarId::RECORD}), \
+        ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yyrestoretag, \
+        ({StxVarId::RESTORETAG, StxVarId::CURSOR, StxVarId::TAG, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yyshift, \
+        ({StxVarId::SHIFT, StxVarId::CURSOR, StxVarId::OFFSET, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yyshiftstag, \
+        ({StxVarId::SHIFTSTAG, StxVarId::TAG, StxVarId::NEG, StxVarId::OFFSET, StxVarId::RECORD}), \
+        ({}), ({StxLOpt::NESTED}) \
+    ) \
+    CODE_TEMPLATE(yyshiftmtag, \
+        ({StxVarId::SHIFTMTAG, StxVarId::TAG, StxVarId::OFFSET}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yystagp, \
+        ({StxVarId::STAGP, StxVarId::TAG, StxVarId::CURSOR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yymtagp, \
+        ({StxVarId::MTAGP, StxVarId::TAG}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yystagn, \
+        ({StxVarId::STAGN, StxVarId::TAG, StxVarId::NEG, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yymtagn, \
+        ({StxVarId::MTAGN, StxVarId::TAG}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yycopystag, \
+        ({StxVarId::COPYSTAG, StxVarId::LHS, StxVarId::RHS, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yycopymtag, \
+        ({StxVarId::COPYMTAG, StxVarId::LHS, StxVarId::RHS, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yygetaccept, \
+        ({StxVarId::GETACCEPT, StxVarId::VAR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yysetaccept, \
+        ({StxVarId::SETACCEPT, StxVarId::VAR, StxVarId::VAL, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yygetcond, \
+        ({StxVarId::GETCOND, StxVarId::VAR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yysetcond, \
+        ({StxVarId::SETCOND, StxVarId::VAR, StxVarId::VAL, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yygetstate, \
+        ({StxVarId::GETSTATE, StxVarId::VAR, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yysetstate, \
+        ({StxVarId::SETSTATE, StxVarId::VAR, StxVarId::VAL, StxVarId::RECORD}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yylessthan, \
+        ({StxVarId::LESSTHAN, StxVarId::NEED, StxVarId::CURSOR, StxVarId::LIMIT, \
+            StxVarId::RECORD}), ({}), ({StxLOpt::MANY}) \
+    ) \
+    CODE_TEMPLATE(yyend, \
+        ({StxVarId::END, StxVarId::CURSOR, StxVarId::LIMIT}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybm_filter, \
+        ({StxVarId::CHAR}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yybm_match, \
+        ({StxVarId::BITMAP, StxVarId::CHAR, StxVarId::OFFSET, StxVarId::MASK}), ({}), ({}) \
+    ) \
+    CODE_TEMPLATE(yytarget_filter, \
+        ({StxVarId::CHAR}), ({}), ({}) \
+    )
+
+#define RE2C_ONELINE_CODES \
+    ONELINE_CODE("code:abort", CodeKind::ABORT) \
+    ONELINE_CODE("code:fncall", CodeKind::FNCALL) \
+    ONELINE_CODE("code:goto", CodeKind::GOTO) \
+    ONELINE_CODE("code:tailcall", CodeKind::FNCALL)
+
+// configuration-local variables in syntax files
+#define RE2C_STX_LOCAL_VARS \
+    STX_LOCAL_VAR(ARG, "arg") \
+    STX_LOCAL_VAR(ARGNAME, "argname") \
+    STX_LOCAL_VAR(ARGTYPE, "argtype") \
+    STX_LOCAL_VAR(ARRAY, "array") \
+    STX_LOCAL_VAR(BASE, "base") \
+    STX_LOCAL_VAR(BRANCH, "branch") \
+    STX_LOCAL_VAR(CASE, "case") \
+    STX_LOCAL_VAR(COND, "cond") \
+    STX_LOCAL_VAR(DATE, "date") \
+    STX_LOCAL_VAR(ELEM, "elem") \
+    STX_LOCAL_VAR(EXPR, "expr") \
+    STX_LOCAL_VAR(FN, "fn") \
+    STX_LOCAL_VAR(FILE, "file") \
+    STX_LOCAL_VAR(FNDECL, "fndecl") \
+    STX_LOCAL_VAR(FNDEF, "fndef") \
+    STX_LOCAL_VAR(INDEX, "index") \
+    STX_LOCAL_VAR(INIT, "init") \
+    STX_LOCAL_VAR(LABEL, "label") \
+    STX_LOCAL_VAR(LHS, "lhs") \
+    STX_LOCAL_VAR(LINE, "line") \
+    STX_LOCAL_VAR(MASK, "mask") \
+    STX_LOCAL_VAR(NAME, "name") \
+    STX_LOCAL_VAR(NEED, "need") \
+    STX_LOCAL_VAR(NEG, "neg") \
+    STX_LOCAL_VAR(OFFSET, "offset") \
+    STX_LOCAL_VAR(RETVAL, "retval") \
+    STX_LOCAL_VAR(RHS, "rhs") \
+    STX_LOCAL_VAR(ROW, "row") \
+    STX_LOCAL_VAR(SIGIL, "sigil") \
+    STX_LOCAL_VAR(SIZE, "size") \
+    STX_LOCAL_VAR(STATE, "state") \
+    STX_LOCAL_VAR(STMT, "stmt") \
+    STX_LOCAL_VAR(TAG, "tag") \
+    STX_LOCAL_VAR(THROW, "throw") \
+    STX_LOCAL_VAR(TYPE, "type") \
+    STX_LOCAL_VAR(VAL, "val") \
+    STX_LOCAL_VAR(VAR, "var") \
+    STX_LOCAL_VAR(VER, "version") \
+    /* vars for API primitives */ \
+    STX_LOCAL_VAR(BACKUP, "YYBACKUP") \
+    STX_LOCAL_VAR(BACKUPCTX, "YYBACKUPCTX") \
+    STX_LOCAL_VAR(BITMAP, "yybm") \
+    STX_LOCAL_VAR(CHAR, "yych") \
+    STX_LOCAL_VAR(COPYMTAG, "YYCOPYMTAG") \
+    STX_LOCAL_VAR(COPYSTAG, "YYCOPYSTAG") \
+    STX_LOCAL_VAR(CTYPE, "YYCTYPE") \
+    STX_LOCAL_VAR(CTXMARKER, "YYCTXMARKER") \
+    STX_LOCAL_VAR(CURSOR, "YYCURSOR") \
+    STX_LOCAL_VAR(DEBUG, "YYDEBUG") \
+    STX_LOCAL_VAR(END, "YYEND") \
+    STX_LOCAL_VAR(GETACCEPT, "YYGETACCEPT") \
+    STX_LOCAL_VAR(GETCOND, "YYGETCOND") \
+    STX_LOCAL_VAR(GETSTATE, "YYGETSTATE") \
+    STX_LOCAL_VAR(INPUT, "YYINPUT") \
+    STX_LOCAL_VAR(LESSTHAN, "YYLESSTHAN") \
+    STX_LOCAL_VAR(LIMIT, "YYLIMIT") \
+    STX_LOCAL_VAR(MARKER, "YYMARKER") \
+    STX_LOCAL_VAR(MTAGN, "YYMTAGN") \
+    STX_LOCAL_VAR(MTAGP, "YYMTAGP") \
+    STX_LOCAL_VAR(PEEK, "YYPEEK") \
+    STX_LOCAL_VAR(RECORD, "yyrecord") \
+    STX_LOCAL_VAR(RESTORE, "YYRESTORE") \
+    STX_LOCAL_VAR(RESTORECTX, "YYRESTORECTX") \
+    STX_LOCAL_VAR(RESTORETAG, "YYRESTORETAG") \
+    STX_LOCAL_VAR(SETACCEPT, "YYSETACCEPT") \
+    STX_LOCAL_VAR(SETCOND, "YYSETCOND") \
+    STX_LOCAL_VAR(SETSTATE, "YYSETSTATE") \
+    STX_LOCAL_VAR(SHIFT, "YYSHIFT") \
+    STX_LOCAL_VAR(SHIFTMTAG, "YYSHIFTMTAG") \
+    STX_LOCAL_VAR(SHIFTSTAG, "YYSHIFTSTAG") \
+    STX_LOCAL_VAR(SKIP, "YYSKIP") \
+    STX_LOCAL_VAR(STAGN, "YYSTAGN") \
+    STX_LOCAL_VAR(STAGP, "YYSTAGP")
+
+// global variables in syntax files
+#define RE2C_STX_GLOBAL_VARS \
+    STX_GLOBAL_VAR(NEWLINE, "nl") \
+    STX_GLOBAL_VAR(INDENT, "indent") \
+    STX_GLOBAL_VAR(DEDENT, "dedent") \
+    STX_GLOBAL_VAR(TOPINDENT, "topindent")
+
+#define STX_LOCAL_VAR(id, name) id,
+#define STX_GLOBAL_VAR(id, name) id,
+enum class StxVarId : uint32_t {
+    RE2C_STX_LOCAL_VARS
+    RE2C_STX_GLOBAL_VARS
 };
+#undef STX_LOCAL_VAR
+#undef STX_GLOBAL_VAR
 
-enum lang_t {
-    LANG_C,
-    LANG_GO
-};
-
-const uint32_t NOEOF = ~0u - 1;
-
-/* note [constant and mutable options]
- *
- * Some options are immutable (target, output files; global switches like
- * conditions, reuse mode, storable states; support of flex syntax, etc.).
- * These options are passed as command-line arguments and never change.
- * It is safe to read them from any program point after parsing command-line
- * arguments.
- *
- * Other options are configurable; they have block scope (may be specified
- * anywhere inside of the block and still affect the whole block).
- * Reading mutable options of yet unparsed block is not allowed because
- * they may affect the way RE2C parses current block (RE2C would be tempted
- * to base decisions on the latest option value, which may not be the final
- * one).
- */
-
+// Immutable options (passed on the command line).
 #define RE2C_CONSTOPTS \
-    CONSTOPT1 (target_t, target, TARGET_CODE) \
-    CONSTOPT (lang_t, lang, LANG_C) \
-    CONSTOPT (bool, bNoGenerationDate, false) \
-    CONSTOPT (bool, version, true) \
-    CONSTOPT (bool, cFlag, false) \
-    CONSTOPT (bool, fFlag, false) \
-    CONSTOPT (bool, rFlag, false) \
-    CONSTOPT (bool, FFlag, false) \
-    CONSTOPT (bool, verbose, false) \
-    /* include paths */ \
-    CONSTOPT (std::vector<std::string>, incpaths, std::vector<std::string>()) \
-    /* input encoding */ \
-    CONSTOPT (Enc::type_t, input_encoding, Enc::ASCII) \
+    CONSTOPT(Target, target, Target::CODE) \
+    CONSTOPT(CodeModel, code_model, CodeModel::GOTO_LABEL) \
+    CONSTOPT(Enc::Type, input_encoding, Enc::Type::ASCII) \
+    CONSTOPT(bool, date, true) \
+    CONSTOPT(bool, version, true) \
+    CONSTOPT(bool, start_conditions, false) \
+    CONSTOPT(bool, storable_state, false) \
+    CONSTOPT(bool, computed_continue, false) \
+    CONSTOPT(bool, flex_syntax, false) \
+    CONSTOPT(bool, verbose, false) \
+    CONSTOPT(bool, line_dirs, true) \
+    /* files */ \
+    CONSTOPT(std::string, source_file, "") \
+    CONSTOPT(std::string, output_file, "") \
+    CONSTOPT(std::string, dep_file, "") \
+    CONSTOPT(std::string, syntax_file, "") \
+    CONSTOPT(std::vector<std::string>, include_paths, std::vector<std::string>()) \
     /* internals */ \
-    CONSTOPT (bool, dfa, true) \
-    CONSTOPT (dfa_minimization_t, dfa_minimization, DFA_MINIMIZATION_MOORE) \
-    CONSTOPT (posix_closure_t, posix_closure, POSIX_CLOSURE_GOR1) \
-    CONSTOPT (posix_prectable_alg_t, posix_prectable, POSIX_PRECTABLE_COMPLEX) \
-    CONSTOPT (bool, lookahead, true) \
-    CONSTOPT (bool, eager_skip, false) \
-    CONSTOPT (bool, optimize_tags, true) \
-    CONSTOPT (bool, backward, false) \
-    CONSTOPT (bool, stadfa, false) \
+    CONSTOPT(Minimization, minimization, Minimization::MOORE) \
+    CONSTOPT(PosixPrectable, posix_prectable, PosixPrectable::COMPLEX) \
+    CONSTOPT(FixedTags, fixed_tags, FixedTags::ALL) \
+    CONSTOPT(bool, optimize_tags, true) \
+    CONSTOPT(bool, nested_negative_tags, true) \
+    CONSTOPT(bool, eager_skip, false) \
     /* debug */ \
-    CONSTOPT (bool, dump_nfa, false) \
-    CONSTOPT (bool, dump_dfa_raw, false) \
-    CONSTOPT (bool, dump_dfa_det, false) \
-    CONSTOPT (bool, dump_dfa_tagopt, false) \
-    CONSTOPT (bool, dump_dfa_min, false) \
-    CONSTOPT (bool, dump_adfa, false) \
-    CONSTOPT (bool, dump_cfg, false) \
-    CONSTOPT (bool, dump_interf, false) \
-    CONSTOPT (bool, dump_closure_stats, false) \
-    CONSTOPT (bool, dump_dfa_tree, false) \
+    CONSTOPT(bool, dump_nfa, false) \
+    CONSTOPT(bool, dump_dfa_raw, false) \
+    CONSTOPT(bool, dump_dfa_det, false) \
+    CONSTOPT(bool, dump_dfa_tagopt, false) \
+    CONSTOPT(bool, dump_dfa_min, false) \
+    CONSTOPT(bool, dump_adfa, false) \
+    CONSTOPT(bool, dump_cfg, false) \
+    CONSTOPT(bool, dump_interf, false) \
+    CONSTOPT(bool, dump_closure_stats, false) \
+    CONSTOPT(bool, dump_dfa_tree, false) \
     /* end */
 
+// Mutable options (configurations) can be set anywhere in a block.
+// They may depend on immutable options, but not on other mutable options.
 #define RE2C_MUTOPTS \
-    /* output files */ \
-    MUTOPT1 (std::string, output_file, "") \
-    MUTOPT (std::string, header_file, "") \
+    /* files */ \
+    MUTOPT(std::string, header_file, "") \
     /* regular expressions */ \
-    MUTOPT (Enc, encoding, Enc ()) \
-    MUTOPT (bool, bCaseInsensitive, false) \
-    MUTOPT (bool, bCaseInverted, false) \
-    MUTOPT (empty_class_policy_t, empty_class_policy, EMPTY_CLASS_MATCH_EMPTY) \
-    /* conditions */ \
-    MUTOPT (std::string, yycondtype, "int") \
-    MUTOPT (std::string, cond_get, "$this->getCondition") \
-    MUTOPT (bool, cond_get_naked, false) \
-    MUTOPT (std::string, cond_set, "$this->setCondition" ) \
-    MUTOPT (std::string, cond_set_arg, "@@" ) \
-    MUTOPT (bool, cond_set_naked, false ) \
-    MUTOPT (std::string, yyctable, "yyctable") \
-    MUTOPT (std::string, condPrefix, "yyc_") \
-    MUTOPT (std::string, condEnumPrefix, "yyc") \
-    MUTOPT (std::string, condDivider, "/* *********************************** */") \
-    MUTOPT (std::string, condDividerParam, "@@") \
-    MUTOPT (std::string, condGoto, "goto @@;") \
-    MUTOPT (std::string, condGotoParam, "@@") \
-    /* states */ \
-    MUTOPT (std::string, state_get, "$this->getState") \
-    MUTOPT (bool, state_get_naked, false) \
-    MUTOPT (std::string, state_set, "$this->setState") \
-    MUTOPT (std::string, state_set_arg, "@@") \
-    MUTOPT (bool, state_set_naked, false) \
-    MUTOPT (std::string, yyfilllabel, "$this->yyFillLabel") \
-    MUTOPT (std::string, yynext, "$this->yyNext") \
-    MUTOPT (std::string, yyaccept, "$this->yyAccept") \
-    MUTOPT (bool, bUseStateAbort, false) \
-    MUTOPT (bool, bUseStateNext, false) \
-    /* tags */ \
-    MUTOPT (bool, tags, false) \
-    MUTOPT (std::string, tags_prefix, "yyt") \
-    MUTOPT (std::string, tags_expression, "@@") \
-    MUTOPT (bool, posix_syntax, false) \
-    MUTOPT (bool, posix_semantics, false) \
+    MUTOPT(Enc,  encoding, Enc()) \
+    MUTOPT(bool, case_insensitive, false) \
+    MUTOPT(bool, case_inverted, false) \
+    MUTOPT(EmptyClass, empty_class, EmptyClass::MATCH_EMPTY) \
+    /* API */ \
+    MUTOPT(Api, api, Api::GENERIC) \
+    MUTOPT(ApiStyle, api_style, ApiStyle::FUNCTIONS) \
+    MUTOPT(std::string, api_sigil, RE2C_SIGIL) \
+    /* variables */ \
+    MUTOPT(std::string, var_accept, "yyaccept") \
+    MUTOPT(std::string, var_bitmaps, "yybm") \
+    MUTOPT(std::string, var_cgoto_table, "yytarget") \
+    MUTOPT(std::string, var_char, "yych") \
+    MUTOPT(std::string, var_cond, "yycond") \
+    MUTOPT(std::string, var_cond_table, "yyctable") \
+    MUTOPT(std::string, var_fill, "") \
+    MUTOPT(std::string, var_state, "yystate") \
+    MUTOPT(std::string, var_nmatch, "yynmatch") \
+    MUTOPT(std::string, var_pmatch, "yypmatch") \
+    MUTOPT(std::string, var_record, "yyrecord") \
     /* code generation */ \
-    MUTOPT (bool, sFlag, false) \
-    MUTOPT (bool, bFlag, false) \
-    MUTOPT (std::string, yybm, "yybm") \
-    MUTOPT (bool, yybmHexTable, false) \
-    MUTOPT (bool, gFlag, false) \
-    MUTOPT (std::string, yytarget, "yytarget") \
-    MUTOPT (uint32_t, cGotoThreshold, 9) \
-    MUTOPT (uint32_t, eof, NOEOF) \
-    MUTOPT (uint32_t, sentinel, NOEOF) \
-    /* formatting */ \
-    MUTOPT (uint32_t, topIndent, 0) \
-    MUTOPT (std::string, indString, "\t") \
-    /* input API */ \
-    MUTOPT (input_api_t, input_api, INPUT_DEFAULT) \
-    MUTOPT (std::string, yybuffer, "$this->buffer") \
-    MUTOPT (std::string, yycursor, "$this->cursor") \
-    MUTOPT (std::string, yymarker, "$this->marker") \
-    MUTOPT (std::string, yyctxmarker, "$this->ctxmarker") \
-    MUTOPT (std::string, yylimit, "$this->limit") \
-    MUTOPT (std::string, yypeek, "$this->peek") \
-    MUTOPT (std::string, yyskip, "$this->skip") \
-    MUTOPT (std::string, yybackup, "$this->backup") \
-    MUTOPT (std::string, yybackupctx, "$this->backupctx") \
-    MUTOPT (std::string, yyrestore, "$this->restore") \
-    MUTOPT (std::string, yyrestorectx, "$this->restorectx") \
-    MUTOPT (std::string, yyrestoretag, "$this->restoretag") \
-    MUTOPT (std::string, yylessthan, "$this->lessthan") \
-    MUTOPT (std::string, yystagn, "$this->stagn") \
-    MUTOPT (std::string, yystagp, "$this->stagp") \
-    MUTOPT (std::string, yystagpd, "$this->stagpd") \
-    MUTOPT (std::string, yymtagn, "$this->mtagn") \
-    MUTOPT (std::string, yymtagp, "$this->mtagp") \
-    MUTOPT (std::string, yymtagpd, "$this->mtagpd") \
-    /* #line directives */ \
-    MUTOPT (bool, iFlag, true) \
-    /* debug */ \
-    MUTOPT (bool, dFlag, false) \
-    MUTOPT (std::string, yydebug, "$this->debug") \
-    /* yych */ \
-    MUTOPT (std::string, yyctype, "string") \
-    MUTOPT (std::string, yych, "$yych") \
-    MUTOPT (bool, bEmitYYCh, false) \
-    MUTOPT (bool, yychConversion, false) \
+    MUTOPT(bool, bitmaps, false) \
+    MUTOPT(bool, bitmaps_hex, false) \
+    MUTOPT(bool, case_ranges, false) \
+    MUTOPT(bool, computed_gotos, false) \
+    MUTOPT(bool, computed_gotos_relative, false) \
+    MUTOPT(uint32_t, computed_gotos_threshold, 9) \
+    MUTOPT(bool, nested_ifs, false) \
+    MUTOPT(bool, unsafe, true) \
+    MUTOPT(bool, monadic, false) \
     /* YYFILL */ \
-    MUTOPT (std::string, fill, "$this->fill") \
-    MUTOPT (bool, fill_use, true) \
-    MUTOPT (bool, fill_check, true) \
-    MUTOPT (std::string, fill_arg, "@@") \
-    MUTOPT (bool, fill_arg_use, true) \
-    MUTOPT (bool, fill_naked, false) \
+    MUTOPT(uint32_t, fill_eof, NOEOF) \
+    MUTOPT(uint32_t, fill_sentinel, NOEOF) \
+    MUTOPT(bool, fill_enable, true) \
+    MUTOPT(bool, fill_check, true) \
+    MUTOPT(std::string, fill_param, RE2C_SIGIL) \
+    MUTOPT(bool, fill_param_enable, true) \
+    MUTOPT(bool, fill_naked, false) \
+    /* yych */ \
+    MUTOPT(bool, char_emit, true) \
+    MUTOPT(bool, char_conv, false) \
+    MUTOPT(CharLit, char_literals, CharLit::CHAR_OR_HEX) \
+    /* conditions */ \
+    MUTOPT(bool, cond_abort, false) \
+    MUTOPT(bool, cond_get_naked, false) \
+    MUTOPT(std::string, cond_set_param, RE2C_SIGIL ) \
+    MUTOPT(bool, cond_set_naked, false ) \
+    MUTOPT(std::string, cond_label_prefix, "yyc_") \
+    MUTOPT(std::string, cond_enum_prefix, "yyc") \
+    MUTOPT(std::string, cond_div_param, RE2C_SIGIL) \
+    MUTOPT(std::string, cond_goto_param, RE2C_SIGIL) \
+    /* states */ \
+    MUTOPT(bool, state_get_naked, false) \
+    MUTOPT(std::string, state_set_param, RE2C_SIGIL) \
+    MUTOPT(bool, state_set_naked, false) \
+    MUTOPT(bool, state_abort, false) \
+    MUTOPT(bool, state_next, false) \
+    /* tags */ \
+    MUTOPT(bool, tags, false) \
+    MUTOPT(bool, tags_automatic, false) \
+    MUTOPT(bool, tags_history, false) \
+    MUTOPT(bool, captures, false) \
+    MUTOPT(bool, captures_posix, false) \
+    MUTOPT(bool, captures_array, false) \
+    MUTOPT(bool, captures_invert, false) \
+    MUTOPT(std::string, tags_prefix, "yyt") \
+    /* functions */ \
+    MUTOPT(std::vector<std::string>, api_fn, \
+            {"<undefined-fn-name>" RE2C_YYFN_SEP "<undefined-fn-type>"}) \
+    MUTOPT(std::string, fn_sep, ";") \
+    MUTOPT(std::string, fn_throw, "") \
     /* labels */ \
-    MUTOPT (std::string, labelPrefix, "yy") \
-    MUTOPT (std::string, startlabel, "") \
-    MUTOPT (bool, startlabel_force, false) \
+    MUTOPT(std::string, label_fill, "yyFillLabel") \
+    MUTOPT(std::string, label_loop, "") \
+    MUTOPT(std::string, label_next, "yyNext") \
+    MUTOPT(std::string, label_prefix, "yy") \
+    MUTOPT(std::string, label_start, "") \
+    MUTOPT(bool, label_start_force, false) \
+    /* formatting */ \
+    MUTOPT(uint32_t, indent_top, 0) \
+    MUTOPT(std::string, indent_str, "\t") \
+    /* debug */ \
+    MUTOPT(bool, debug, false) \
     /* end */
 
-struct conopt_t
-{
-#    define CONSTOPT1 CONSTOPT
-#    define CONSTOPT(type, name, value) type name;
-    RE2C_CONSTOPTS
-#    undef CONSTOPT1
-#    undef CONSTOPT
+// Mutable code templates may depend on other options (both mutable and immutable ones).
+// In source files their value is a string; in syntax files it is a code template (the latter
+// allows one to set API defauls conditionally based on the chosen API, style, sigil etc.).
+#define RE2C_MUTCODES \
+    MUTCODE(api_char_type) \
+    MUTCODE(api_cond_type) \
+    MUTCODE(api_input) \
+    MUTCODE(api_cursor) \
+    MUTCODE(api_marker) \
+    MUTCODE(api_ctxmarker) \
+    MUTCODE(api_limit) \
+    MUTCODE(api_maxfill) \
+    MUTCODE(api_maxnmatch) \
+    MUTCODE(api_peek) \
+    MUTCODE(api_skip) \
+    MUTCODE(api_backup) \
+    MUTCODE(api_backup_ctx) \
+    MUTCODE(api_restore) \
+    MUTCODE(api_restore_ctx) \
+    MUTCODE(api_restore_tag) \
+    MUTCODE(api_less_than) \
+    MUTCODE(api_stag_neg) \
+    MUTCODE(api_stag_pos) \
+    MUTCODE(api_mtag_neg) \
+    MUTCODE(api_mtag_pos) \
+    MUTCODE(api_stag_copy) \
+    MUTCODE(api_mtag_copy) \
+    MUTCODE(api_shift) \
+    MUTCODE(api_stag_shift) \
+    MUTCODE(api_mtag_shift) \
+    MUTCODE(api_end) \
+    MUTCODE(api_fill) \
+    MUTCODE(api_cond_get) \
+    MUTCODE(api_cond_set) \
+    MUTCODE(api_state_get) \
+    MUTCODE(api_state_set) \
+    MUTCODE(api_accept_get) \
+    MUTCODE(api_accept_set) \
+    MUTCODE(api_debug) \
+    MUTCODE(tags_expression) \
+    MUTCODE(tags_negative) \
+    MUTCODE(cond_div) \
+    MUTCODE(cond_goto) \
+    /* end */
 
-    conopt_t()
-#        define CONSTOPT1(type, name, value) : name(value)
-#        define CONSTOPT(type, name, value)  , name(value)
-        RE2C_CONSTOPTS
-#        undef CONSTOPT1
-#        undef CONSTOPT
-    {}
-    void fix();
+#define CODE_TEMPLATE(name, vars, list_vars, conds) STX_##name,
+#define MUTCODE(name) STX_##name,
+enum class StxCodeId : uint32_t {
+    RE2C_CODE_TEMPLATES
+    RE2C_MUTCODES
+};
+#undef CODE_TEMPLATE
+#undef MUTCODE
+
+enum class StxOptKind {GLOB, LOC, IMM, NEG, AND, OR};
+
+struct StxOpt {
+    StxOptKind kind;
+    union {
+        StxGOpt gopt;
+        StxLOpt lopt;
+        bool imm;
+        StxOpt* neg;
+        struct {
+            StxOpt* lhs;
+            StxOpt* rhs;
+        } op;
+    };
+};
+
+struct StxCodeCond {
+    StxOpt* opt;
+    StxCodes* then_code;
+    StxCodes* else_code;
+};
+
+struct StxCodeList {
+    StxVarId var;
+    int32_t lbound;
+    int32_t rbound;
+    StxCodes* code;
+};
+
+enum class StxCodeType {STR, VAR, COND, LIST, UD};
+
+struct StxCode {
+    StxCodeType type;
+    union {
+        const char* str;
+        StxVarId var;
+        StxCodeCond cond;
+        StxCodeList list;
+    };
+    StxCode* next;
+};
+
+bool is_undefined(const StxCodes* code);
+
+// Constant options.
+struct conopt_t {
+    // Global options are public (for easier read access), but constant (to avoid
+    // accidental write access, as this should be done by `set_*` methods that correctly
+    // update `is_default_*` status).
+#define CONSTOPT(type, name, value) const type name; bool is_default_##name;
+    RE2C_CONSTOPTS
+#undef CONSTOPT
+    // Syntax file options.
+#define CHECKED_LIST(name, allowed) const std::vector<std::string> name;
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define STX_OPT(type, name, value) const type name;
+    RE2C_STX_OPTS
+#undef STX_OPT
+#define CODE_TEMPLATE(name, vars, list_vars, conds) const StxCodes* code_##name;
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+    bool p2067; // until c++ allows trailing comma in macro-expanded ctor-intializer
+
+    conopt_t() :
+#define CONSTOPT(type, name, value) name(value), is_default_##name(true),
+    RE2C_CONSTOPTS
+#undef CONSTOPT
+#define CHECKED_LIST(name, allowed) name(),
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define STX_OPT(type, name, value) name(value),
+    RE2C_STX_OPTS
+#undef STX_OPT
+#define CODE_TEMPLATE(name, vars, list_vars, conds) code_##name(nullptr),
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+    p2067() {}
+
+#define CONSTOPT(type, name, value) \
+    void set_##name(const type & val) { \
+        const_cast<type&>(name) = val; \
+        is_default_##name = false; \
+    } \
+    void init_##name(const type &arg) { \
+        if (is_default_##name) { \
+            const_cast<type&>(name) = arg; \
+        } \
+    }
+    RE2C_CONSTOPTS
+#undef CONSTOPT
+#define CHECKED_LIST(name, allowed) \
+    bool name##_contains(const std::string& what) const { \
+        return name.end() != std::find(name.begin(), name.end(), what); \
+    }
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define CODE_TEMPLATE(name, vars, list_vars, conds) \
+    bool have_conf_code_##name() const { \
+        return !is_undefined(code_##name); \
+    }
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+
     FORBID_COPY(conopt_t);
 };
 
-struct mutopt_t
-{
-#    define MUTOPT1 MUTOPT
-#    define MUTOPT(type, name, value) type name;
+// Mutable options.
+struct mutopt_t {
+#define MUTOPT(type, name, value) type name;
     RE2C_MUTOPTS
-#    undef MUTOPT1
-#    undef MUTOPT
+#undef MUTOPT
+#define MUTCODE(name) const StxCodes* name;
+    RE2C_MUTCODES
+#undef MUTCODE
+    bool p2067; // until c++ allows trailing comma in macro-expanded ctor-intializer
 
-    mutopt_t()
-#        define MUTOPT1(type, name, value) : name(value)
-#        define MUTOPT(type, name, value)  , name(value)
-        RE2C_MUTOPTS
-#        undef MUTOPT1
-#        undef MUTOPT
-    {}
-    void fix(const conopt_t *globopts);
+    mutopt_t() :
+#define MUTOPT(type, name, value) name(value),
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) name(nullptr),
+    RE2C_MUTCODES
+#undef MUTCODE
+    p2067() {}
+
     FORBID_COPY(mutopt_t);
 };
 
-struct opt_t
-{
-#    define CONSTOPT1 CONSTOPT
-#    define CONSTOPT(type, name, value) type name;
-    RE2C_CONSTOPTS
-#    undef CONSTOPT1
-#    undef CONSTOPT
-
-#    define MUTOPT1 MUTOPT
-#    define MUTOPT(type, name, value) type name;
+// Boolean flags for mutable options.
+struct mutdef_t {
+#define MUTOPT(type, name, value) bool name;
     RE2C_MUTOPTS
-#    undef MUTOPT1
-#    undef MUTOPT
+#undef MUTOPT
+#define MUTCODE(name) bool name;
+    RE2C_MUTCODES
+#undef MUTCODE
+    bool p2067; // until c++ allows trailing comma in macro-expanded ctor-intializer
 
-    opt_t(const conopt_t &con, const mutopt_t &mut)
-#        define CONSTOPT1(type, name, value) : name(con.name)
-#        define CONSTOPT(type, name, value)  , name(con.name)
-        RE2C_CONSTOPTS
-#        undef CONSTOPT1
-#        undef CONSTOPT
-#        define MUTOPT1 MUTOPT
-#        define MUTOPT(type, name, value) , name(mut.name)
-        RE2C_MUTOPTS
-#        undef MUTOPT1
-#        undef MUTOPT
-    {}
+    mutdef_t() :
+#define MUTOPT(type, name, value) name(true),
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) name(true),
+    RE2C_MUTCODES
+#undef MUTCODE
+    p2067() {}
 };
 
-// see note [constant and mutable options]
-struct Opt
-{
-    static const mutopt_t baseopt;
+// Union of constant and mutable options and default flags.
+struct opt_t {
+  private:
+    using stack_code_t = std::vector<std::pair<const StxCode*, uint8_t>>;
 
-    const char *source_file;
-    const conopt_t &glob;
+    // stack is placed here to avoid reallocating it every time
+    mutable stack_code_t stack_code;
 
-private:
+  public:
+#define CONSTOPT(type, name, value) type name;
+    RE2C_CONSTOPTS
+#undef CONSTOPT
+#define CHECKED_LIST(name, allowed) const std::vector<std::string> name;
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define STX_OPT(type, name, value) const type name;
+    RE2C_STX_OPTS
+#undef STX_OPT
+#define CODE_TEMPLATE(name, vars, list_vars, conds) const StxCodes* code_##name;
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+#define MUTOPT(type, name, value) type name;
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) std::string name; const StxCodes* code_##name;
+    RE2C_MUTCODES
+#undef MUTCODE
+#define MUTOPT(type, name, value) bool is_default_##name;
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) bool is_default_##name;
+    RE2C_MUTCODES
+#undef MUTCODE
+    symtab_t symtab;
+
+    opt_t(const conopt_t& con, const mutopt_t& mut, const mutdef_t& def, const symtab_t& symtab)
+        : stack_code(),
+#define CONSTOPT(type, name, value) name(con.name),
+    RE2C_CONSTOPTS
+#undef CONSTOPT
+#define CHECKED_LIST(name, allowed) name(con.name),
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define STX_OPT(type, name, value) name(con.name),
+    RE2C_STX_OPTS
+#undef STX_OPT
+#define CODE_TEMPLATE(name, vars, list_vars, conds) code_##name(con.code_##name),
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+#define MUTOPT(type, name, value) name(mut.name),
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) name(this->gen_##name(mut.name)), code_##name(mut.name),
+    RE2C_MUTCODES
+#undef MUTCODE
+#define MUTOPT(type, name, value) is_default_##name(def.name),
+    RE2C_MUTOPTS
+#undef MUTOPT
+#define MUTCODE(name) is_default_##name(def.name),
+    RE2C_MUTCODES
+#undef MUTCODE
+    symtab(symtab) {}
+
+#define CODE_TEMPLATE(name, vars, list_vars, conds) \
+    const char* gen_code_##name(Scratchbuf& buf, RenderCallback& callback) const; \
+    const char* gen_code_##name(Scratchbuf& buf) const; \
+    void render_code_##name(std::ostream& os, RenderCallback& callback) const; \
+    void render_code_##name(std::ostream& os) const;
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+#define MUTCODE(name) \
+    std::string gen_##name(const StxCodes* code) const;
+    RE2C_MUTCODES
+#undef MUTCODE
+    bool specialize_oneline_if() const {
+        return !is_undefined(code_if_then_else_oneline);
+    }
+    bool specialize_oneline_switch() const {
+        return !is_undefined(code_switch_cases_oneline);
+    }
+    bool specialize_skip_peek_backup() const {
+        return !is_undefined(code_yyskip_yypeek)
+            && !is_undefined(code_yypeek_yyskip)
+            && !is_undefined(code_yyskip_yybackup)
+            && !is_undefined(code_yybackup_yyskip)
+            && !is_undefined(code_yybackup_yypeek)
+            && !is_undefined(code_yyskip_yybackup_yypeek)
+            && !is_undefined(code_yybackup_yypeek_yyskip);
+    }
+
+  private:
+    void eval_code_conf(StxCodeId id, const char* name, const StxCodes* code,
+        std::ostream& os) const;
+    void eval_code_conf(StxCodeId id, const char* name, const StxCodes* code,
+        std::ostream& os, RenderCallback& callback) const;
+    void push_list_on_stack(const StxCode* x) const;
+
+    FORBID_COPY(opt_t);
+};
+
+// Options management.
+struct Opt {
+  private:
+    using stack_code_t = std::vector<std::pair<const StxCode*, uint8_t>>;
+    using stack_code_list_t = std::vector<const StxCode*>;
+
+  public:
+    const conopt_t glob;
+    symtab_t symtab;
+    Msg& msg;
+
+  private:
+    OutAllocator& alc;
+
+    // Default mutable options. They depend on the global options, such as the language backend, and
+    // are fixed after parsing the global options.
+    const mutopt_t defaults;
+
+    // Boolean flags indicating if a mutable option has been set by the user. These are needed to
+    // distingush default values from user-set values that coincide with default ones. Constant and
+    // mutable options passed on the command line may be intermixed (there is no ordering
+    // requirement), so mutable options may be applied before all constant options are known and
+    // default values for mutable options are determined. Such user-set mutable options should not
+    // be altered by fixing default options.
+    mutdef_t is_default;
+
+    // User-set mutable options.
     mutopt_t user;
+
+    // Real mutable options ("fixed" user-set options with various filters and implications that
+    // make options consistent).
     mutopt_t real;
+
+    // If user-set options have diverged from the real ones and need syncing.
     bool diverge;
 
-    void sync()
-    {
-        if (!diverge) return;
-#        define MUTOPT1 MUTOPT
-#        define MUTOPT(type, name, value) real.name = user.name;
-        RE2C_MUTOPTS
-#        undef MUTOPT1
-#        undef MUTOPT
-        real.fix(&glob);
-        diverge = false;
-    }
+    // stacks are placed here to avoid reallocating them every time
+    stack_code_t stack_code;
+    stack_code_list_t stack_code_list;
 
-public:
-    explicit Opt(const conopt_t &globopts)
-        : source_file(NULL)
-        , glob(globopts)
-        , user()
-        , real()
-        , diverge(true)
-    {}
+  public:
+    Opt(OutAllocator& alc, Msg& msg);
+    const conopt_t& global() const { return glob; }
+    Ret parse(char** argv, Input& input, Lang lang);
+    Ret snapshot(const opt_t** opts) NODISCARD;
+    Ret fix_global_and_defaults() NODISCARD;
+    Ret restore(const opt_t* opts) NODISCARD;
+    Ret merge(const opt_t* opts, Input& input) NODISCARD;
 
-    const opt_t *snapshot()
-    {
-        sync();
-        return new opt_t(glob, real);
-    }
-
-    void restore(const opt_t *opts)
-    {
-#        define MUTOPT1 MUTOPT
-#        define MUTOPT(type, name, value) user.name = opts->name;
-        RE2C_MUTOPTS
-#        undef MUTOPT1
-#        undef MUTOPT
-        diverge = true;
-        sync();
-    }
-
-    bool source (const char *s);
-
-    // RE2C allows to set configurations anywhere inside of a block
-    // (in the beginning, intermixed with rules, in the end): they will
-    // affect the whole block anyway. Thus one is not allowed to read
-    // configurations until the whole block has been parsed. Immutable
-    // options, on the contrary, are accessible for reading all the time
-    // (the parser itself depends on them).
-    void set_encoding(Enc::type_t t)          { user.encoding.set(t); }
-    void unset_encoding(Enc::type_t t)        { user.encoding.unset(t); }
-    void set_encoding_policy(Enc::policy_t p) { user.encoding.setPolicy(p); }
-#define MUTOPT1 MUTOPT
-#define MUTOPT(type, name, value) void set_##name (const type &arg) { user.name = arg; diverge = true; }
+#define MUTOPT(type, name, value) \
+    void init_##name(const type &arg); \
+    void set_##name(const type &arg); \
+    void reset_##name();
     RE2C_MUTOPTS
-#undef MUTOPT1
 #undef MUTOPT
+#define MUTCODE(name) \
+    void init_##name(const StxCodes* arg); \
+    void set_##name(const StxCodes* arg);
+    RE2C_MUTCODES
+#undef MUTCODE
+#define CHECKED_LIST(name, allowed) \
+    void set_##name(const std::vector<std::string>& list); \
+    Ret check_##name() NODISCARD;
+    RE2C_CHECKED_LISTS
+#undef CHECKED_LIST
+#define STX_OPT(type, name, value) \
+    void set_##name(const type & val);
+    RE2C_STX_OPTS
+#undef STX_OPT
+#define CODE_TEMPLATE(name, vars, list_vars, conds) \
+    /* void set_code_##name(const StxCodes* code); */ \
+    Ret check_code_##name(Warn& warn) NODISCARD;
+    RE2C_CODE_TEMPLATES
+#undef CODE_TEMPLATE
+    void init_encoding(Enc::Type type, bool on);
+    void init_encoding_policy(Enc::Policy p);
+    void set_encoding(Enc::Type type, bool on);
+    void set_encoding_policy(Enc::Policy p);
 
-    // bad temporary hacks, should be fixed by proper scoping of config (parts).
-    void reset_startlabel();
-    void reset_mapCodeName ();
+    void reset_group_label_start();
 
-    FORBID_COPY (Opt);
+    StxCodes* new_code_list();
+    StxCode* make_code_str(const char* str);
+    StxCode* make_code_var(StxVarId id);
+    StxCode* make_code_cond(StxOpt* opt, StxCodes* code_then, StxCodes* code_else);
+    StxCode* make_code_list(StxVarId var, int32_t lbound, int32_t rbound, StxCodes* code);
+    StxCodes* make_code_undefined();
+    StxOpt* make_opt_global(StxGOpt opt);
+    StxOpt* make_opt_local(StxLOpt opt);
+    StxOpt* make_opt_imm(bool b);
+    StxOpt* make_opt_neg(StxOpt* x);
+    StxOpt* make_opt_and(StxOpt* x, StxOpt* y);
+    StxOpt* make_opt_or(StxOpt* x, StxOpt* y);
+    StxCodes* make_api(const std::string& str);
+
+    Ret validate_conf_code(
+        const StxCodes* code,
+        const char* conf,
+        const std::unordered_set<StxVarId>& vars,
+        const std::unordered_set<StxVarId>& list_vars,
+        const std::unordered_set<StxLOpt>& conds) NODISCARD;
+
+  private:
+    Ret sync() NODISCARD;
+
+    static const char* var_name(StxVarId id);
+
+    StxCode* make_code(StxCodeType type);
+
+    Ret check_cond(StxLOpt opt, const char* conf, const std::unordered_set<StxLOpt>& conds) const;
+    Ret check_var(StxVarId var, const char* conf, const std::unordered_set<StxVarId>& vars,
+        const std::unordered_set<StxVarId>& list_vars) const;
+
+    FORBID_COPY(Opt);
 };
 
-enum parse_opts_t
-{
-    OK,
-    EXIT_OK,
-    EXIT_FAIL
-};
-
-parse_opts_t parse_opts(char **argv, conopt_t &globopts, Opt &opts, Msg &msg);
+Ret parse_opts(char** argv, conopt_t& globopts, Opt& opts, Msg& msg) NODISCARD;
 
 } // namespace re2c
+
+namespace std {
+
+// Some toolchains require `std::hash` specialization for `std::unordered_set`.
+#define GEN_STD_HASH(type) \
+template<> struct hash<type> { \
+    size_t operator()(type v) const { \
+        hash<uint32_t> h; \
+        return h(static_cast<uint32_t>(v)); \
+    } \
+}
+GEN_STD_HASH(re2c::StxVarId);
+GEN_STD_HASH(re2c::StxLOpt);
+GEN_STD_HASH(re2c::CodeKind);
+#undef GEN_STD_HASH
+
+} // namespace std
 
 #endif // _RE2C_CONF_OPT_
