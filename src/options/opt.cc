@@ -254,6 +254,11 @@ LOCAL_NODISCARD(Ret fix_mutopt(
     if (is_default.cond_set_naked)  real.cond_set_naked  = real.api_style == ApiStyle::FREEFORM;
     if (is_default.state_get_naked) real.state_get_naked = real.api_style == ApiStyle::FREEFORM;
     if (is_default.state_set_naked) real.state_set_naked = real.api_style == ApiStyle::FREEFORM;
+    // PHP uses a free-form API, but its default YYFILL is a function call and needs the
+    // length argument and trailing semicolon added by re2c (legacy PHP backend behavior).
+    if (glob.lang == Lang::PHP && is_default.fill_naked) {
+        real.fill_naked = false;
+    }
     // individual template options, unless explicitly set, inherit "api:sigil"
     if (!is_default.api_sigil) {
         if (is_default.fill_param)       real.fill_param      = real.api_sigil;

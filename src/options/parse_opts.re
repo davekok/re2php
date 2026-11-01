@@ -240,22 +240,23 @@ opt_long: /*!local:re2c
 opt_lang: /*!local:re2c
     * {
         ERRARG("--lang",
-            "c | d | go | haskell | java | js | ocaml | python | rust | swift | v | zig | none",
+            "c | d | go | haskell | java | js | ocaml | php | python | rust | swift | v | zig | none",
             *argv);
     }
-    "c"       end { *lang = Lang::C;       goto opt; }
-    "d"       end { *lang = Lang::D;       goto opt; }
-    "go"      end { *lang = Lang::GO;      goto opt; }
-    "haskell" end { *lang = Lang::HASKELL; goto opt; }
-    "java"    end { *lang = Lang::JAVA;    goto opt; }
-    "js"      end { *lang = Lang::JS;      goto opt; }
-    "ocaml"   end { *lang = Lang::OCAML;   goto opt; }
-    "python"  end { *lang = Lang::PYTHON;  goto opt; }
-    "rust"    end { *lang = Lang::RUST;    goto opt; }
-    "swift"   end { *lang = Lang::SWIFT;   goto opt; }
-    "v"       end { *lang = Lang::V;       goto opt; }
-    "zig"     end { *lang = Lang::ZIG;     goto opt; }
-    "none"    end { *lang = Lang::NONE;    goto opt; }
+    "c"       end { *lang = Lang::C;       global.set_lang(*lang); goto opt; }
+    "d"       end { *lang = Lang::D;       global.set_lang(*lang); goto opt; }
+    "go"      end { *lang = Lang::GO;      global.set_lang(*lang); goto opt; }
+    "haskell" end { *lang = Lang::HASKELL; global.set_lang(*lang); goto opt; }
+    "java"    end { *lang = Lang::JAVA;    global.set_lang(*lang); goto opt; }
+    "js"      end { *lang = Lang::JS;      global.set_lang(*lang); goto opt; }
+    "ocaml"   end { *lang = Lang::OCAML;   global.set_lang(*lang); goto opt; }
+    "php"     end { *lang = Lang::PHP;     global.set_lang(*lang); goto opt; }
+    "python"  end { *lang = Lang::PYTHON;  global.set_lang(*lang); goto opt; }
+    "rust"    end { *lang = Lang::RUST;    global.set_lang(*lang); goto opt; }
+    "swift"   end { *lang = Lang::SWIFT;   global.set_lang(*lang); goto opt; }
+    "v"       end { *lang = Lang::V;       global.set_lang(*lang); goto opt; }
+    "zig"     end { *lang = Lang::ZIG;     global.set_lang(*lang); goto opt; }
+    "none"    end { *lang = Lang::NONE;    global.set_lang(*lang); goto opt; }
 */
 
 opt_output: /*!local:re2c
@@ -356,7 +357,7 @@ Ret Opt::parse(char** argv, Input& input, Lang lang) {
     CHECK_RET(parse_opts(*this, const_cast<conopt_t&>(glob), argv, msg, &lang));
 
     // Load syntax file (it must have file index 0).
-    CHECK_RET(input.load_syntax_config(*this, lang));
+    CHECK_RET(input.load_syntax_config(*this, glob.lang));
 
     // Set option defaults.
     CHECK_RET(fix_global_and_defaults());

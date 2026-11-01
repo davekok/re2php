@@ -144,11 +144,11 @@ Ret Output::new_block(Opt& opts, InputBlock kind, std::string name, const loc_t&
 Ret Output::gen_prolog(Opt& opts, const loc_t& loc) {
     header_mode(true);
     CHECK_RET(new_block(opts, InputBlock::GLOBAL, "", loc));
-    gen_stmt(code_fingerprint(allocator));
+    if (opts.global().lang != Lang::PHP) gen_stmt(code_fingerprint(allocator));
 
     header_mode(false);
     CHECK_RET(new_block(opts, InputBlock::GLOBAL, "", loc));
-    gen_stmt(code_fingerprint(allocator));
+    if (opts.global().lang != Lang::PHP) gen_stmt(code_fingerprint(allocator));
     if (block().opts->line_dirs) gen_stmt(code_line_info_input(allocator, loc));
 
     if (block().opts->target == Target::SKELETON) {

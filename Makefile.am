@@ -150,6 +150,7 @@ re2c_GEN_STX = \
 	src/default_syntax_java.h \
 	src/default_syntax_js.h \
 	src/default_syntax_ocaml.h \
+	src/default_syntax_php.h \
 	src/default_syntax_python.h \
 	src/default_syntax_rust.h \
 	src/default_syntax_swift.h \
@@ -187,6 +188,7 @@ re2c_BOOT = \
 	bootstrap/src/default_syntax_java.h \
 	bootstrap/src/default_syntax_js.h \
 	bootstrap/src/default_syntax_ocaml.h \
+	bootstrap/src/default_syntax_php.h \
 	bootstrap/src/default_syntax_python.h \
 	bootstrap/src/default_syntax_rust.h \
 	bootstrap/src/default_syntax_swift.h \
@@ -199,6 +201,7 @@ re2c_BOOT = \
 	bootstrap/src/msg/help_re2java.cc \
 	bootstrap/src/msg/help_re2js.cc \
 	bootstrap/src/msg/help_re2ocaml.cc \
+	bootstrap/src/msg/help_re2php.cc \
 	bootstrap/src/msg/help_re2py.cc \
 	bootstrap/src/msg/help_re2rust.cc \
 	bootstrap/src/msg/help_re2swift.cc \
@@ -591,6 +594,9 @@ if WITH_OCAML
 DOCS += doc/re2ocaml.1
 HELP += src/msg/help_re2ocaml.cc
 endif
+if WITH_PHP
+HELP += src/msg/help_re2php.cc
+endif
 if WITH_PYTHON
 DOCS += doc/re2py.1
 HELP += src/msg/help_re2py.cc
@@ -624,6 +630,7 @@ dist_stdlib_DATA = \
 	include/syntax/java \
 	include/syntax/js \
 	include/syntax/ocaml \
+	include/syntax/php \
 	include/syntax/python \
 	include/syntax/rust \
 	include/syntax/swift \
@@ -858,6 +865,14 @@ bin_PROGRAMS += re2ocaml
 re2ocaml_CXXFLAGS = $(AM_CXXFLAGS) -DRE2C_LANG=Lang::OCAML -DRE2C_PROG=\"re2ocaml\"
 re2ocaml_SOURCES = $(re2c_SOURCES)
 nodist_re2ocaml_SOURCES = $(re2c_GEN) src/msg/help_re2ocaml.cc
+endif
+
+# re2php
+if WITH_PHP
+bin_PROGRAMS += re2php
+re2php_CXXFLAGS = $(AM_CXXFLAGS) -DRE2C_LANG=Lang::PHP -DRE2C_PROG=\"re2php\"
+re2php_SOURCES = $(re2c_SOURCES)
+nodist_re2php_SOURCES = $(re2c_GEN) src/msg/help_re2php.cc
 endif
 
 # re2py

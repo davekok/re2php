@@ -424,6 +424,7 @@ enum class StxVarId : uint32_t {
 // Immutable options (passed on the command line).
 #define RE2C_CONSTOPTS \
     CONSTOPT(Target, target, Target::CODE) \
+    CONSTOPT(Lang, lang, RE2C_LANG) \
     CONSTOPT(CodeModel, code_model, CodeModel::GOTO_LABEL) \
     CONSTOPT(Enc::Type, input_encoding, Enc::Type::ASCII) \
     CONSTOPT(bool, date, true) \

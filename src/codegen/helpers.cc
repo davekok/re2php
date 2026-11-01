@@ -10,6 +10,10 @@ static inline char hex(uint32_t c) {
     return HEX_TABLE[c & 0x0F];
 }
 
+static inline bool is_php(const opt_t* opts) {
+    return opts->lang == Lang::PHP;
+}
+
 static void print_char(std::ostream& o, uint32_t c, const opt_t* opts) {
     bool dot = opts->target == Target::DOT;
     if (dot) {
@@ -22,6 +26,18 @@ static void print_char(std::ostream& o, uint32_t c, const opt_t* opts) {
             case '\r': o << "\\\\r"; return;
             case '\f': o << "\\\\f"; return;
             case '\a': o << "\\\\a"; return;
+            case '\\': o << "\\\\"; return;
+            default: break;
+        }
+    } else if (is_php(opts)) {
+        switch (c) {
+            case '"': o << "\\\""; return;
+            case '$': o << "\\$"; return;
+            case '\n': o << "\\n"; return;
+            case '\t': o << "\\t"; return;
+            case '\v': o << "\\v"; return;
+            case '\r': o << "\\r"; return;
+            case '\f': o << "\\f"; return;
             case '\\': o << "\\\\"; return;
             default: break;
         }
@@ -73,7 +89,11 @@ static bool print_as_char(uint32_t c, const opt_t* opts) {
 }
 
 void print_char_or_hex(std::ostream& o, uint32_t c, const opt_t* opts) {
-    if (print_as_char(c, opts)) {
+    if (is_php(opts)) {
+        o << '"';
+        print_char(o, c, opts);
+        o << '"';
+    } else if (print_as_char(c, opts)) {
         o << '\'';
         print_char(o, c, opts);
         o << '\'';

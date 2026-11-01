@@ -69,6 +69,9 @@ The configure script has many options (to see them all, run
   * `--enable-ocaml`
     Build re2ocaml (identical to `re2c --lang ocaml`). This is on by default.
 
+  * `--enable-php`
+    Build re2php (identical to `re2c --lang php`). This is on by default.
+
   * `--enable-python`
     Build re2py (identical to `re2c --lang python`). This is on by default.
 
@@ -205,6 +208,10 @@ specific to re2c:
 
   * `-DRE2C_BUILD_RE2OCAML=yes`
     Build re2ocaml executable (an alias to `re2c --lang ocaml`). Enabled by
+    default.
+
+  * `-DRE2C_BUILD_RE2PHP=yes`
+    Build re2php executable (an alias to `re2c --lang php`). Enabled by
     default.
 
   * `-DRE2C_BUILD_RE2PY=yes`

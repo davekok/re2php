@@ -25,6 +25,7 @@ enum class Lang: uint32_t {
     SWIFT,
     V,
     ZIG,
+    PHP,
     NONE // no language (no default syntax config will be loaded)
 };
 
