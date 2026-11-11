@@ -1,137 +1,165 @@
 #include <stddef.h>
 #include <vector>
 
-#include "src/codegen/input_api.h"
 #include "src/options/opt.h"
-#include "src/regexp/re.h"
+#include "src/regexp/regexp.h"
 #include "src/regexp/tag.h"
-
+#include "src/util/check.h"
 
 namespace re2c {
 namespace {
 
-/* note [fixed and variable tags]
- *
- * If distance between two tags is constant (equal for all strings that match
- * the given regexp), then lexer only needs to track one of them: the second
- * tag equals the first tag plus static offset.
- *
- * This optimization is applied only to tags in top-level concatenation,
- * because in other cases the base tag may be NULL, and the calculation of
- * the fixed tag value is not as simple as substracting a fixed offset.
- * Furthermore, fixed tags are fobidden with generic API because it cannot
- * express fixed offsets. M-tags (with history) also cannot be fixed.
- *
- * Another special case is fictive tags (those that exist only to impose
- * hierarchical laws of POSIX disambiguation). We treat them as fixed in order
- * to suppress code generation.
- */
+// note [fixed and variable tags]
+//
+// If the distance between two tags is constant, then the lexer only needs to track one of the two
+// tags: the value of the other tag equals the value of the first tag plus a static offset. For tags
+// that are under alternative or repetition it is also necessary to check if the base tag has a
+// no-match value (in that case fixed tag should also be set to no-match). For tags in top-level
+// concatenation the check is not needed, because they always match.
+//
+// This optimization does not apply to m-tags (a.k.a. tags with history).
+//
+// A special case is fictive tags (structural POSIX tags that exist only for disambiguation
+// purposes). Such tags are treated as fixed in order to suppress code generation.
 
 struct StackItem {
-    RE       *re;       // current sub-RE
-    uint32_t  dist;     // distance backup for alternative, unused for other RE
-    uint8_t   succ;     // index of the next successor to be visited
-    bool      toplevel; // if this sub-RE is in top-level concatenation
+    Regexp* re;   // current sub-regexp
+    uint8_t succ; // index of the next successor to be visited
 };
 
-static void find_fixed_tags(RESpec &spec, std::vector<StackItem> &stack, RE *re0)
-{
-    static const uint32_t VARDIST = Tag::VARDIST;
-    bool toplevel = spec.opts->input_api != INPUT_CUSTOM;
+// level is increased when descending into alternative or repetition
+struct Level {
+    size_t tag;           // current base tag
+    uint32_t dist_to_tag; // distance to base tag
+    uint32_t dist_to_end; // full level distance
+};
 
-    // base tag, intially the fake "rightmost tag" (the end of RE)
-    size_t base = Tag::RIGHTMOST;
+static void find_fixed_tags(
+        RESpec& spec, std::vector<StackItem>& stack, std::vector<Level>& levels, Regexp* re0) {
+    static constexpr uint32_t VARDIST = Tag::VARDIST;
 
-    // the distance to the nearest top-level tag to the right (base tag)
-    uint32_t dist = 0;
+    // initial base tag at the topmost level is the fake "rightmost tag" (cursor)
+    DCHECK(levels.empty());
+    levels.push_back({Tag::RIGHTMOST, 0, 0});
 
-    const StackItem i0 = {re0, VARDIST, 0, toplevel};
-    stack.push_back(i0);
+    stack.push_back({re0, 0});
 
     while (!stack.empty()) {
         const StackItem i = stack.back();
         stack.pop_back();
-        RE *re = i.re;
+        Regexp* re = i.re;
 
-        if (re->type == RE::SYM) {
-            if (dist != VARDIST) ++dist;
-        }
-        else if (re->type == RE::ALT) {
+        if (re->kind == Regexp::Kind::SYM) {
+            Level& l = levels.back();
+            if (l.dist_to_tag != VARDIST) ++l.dist_to_tag;
+            if (l.dist_to_end != VARDIST) ++l.dist_to_end;
+
+        } else if (re->kind == Regexp::Kind::ALT) {
             if (i.succ == 0) {
-                // save the current distance on stack (from the alternative end
-                // to base) and recurse into the left sub-RE
-                StackItem k = {re, dist, 1, i.toplevel};
-                stack.push_back(k);
-                StackItem j = {re->alt.re1, VARDIST, 0, false};
-                stack.push_back(j);
+                // recurse into the left sub-regexp (leave the current regexp on stack)
+                stack.push_back({re, 1});
+                stack.push_back({re->alt.re1, 0});
+
+                // increase level when descending into the left sub-regexp
+                levels.push_back({Tag::NONE, 0, 0});
+
+            } else if (i.succ == 1) {
+                // recurse into the right sub-regexp (leave the current regexp on stack)
+                stack.push_back({re, 2});
+                stack.push_back({re->alt.re2, 0});
+
+                // increase level when descending into the right sub-regexp (keep the left
+                // sub-regexp level on stack, it will be needed to compare left and right distance)
+                levels.push_back({Tag::NONE, 0, 0});
+
+            } else {
+                // both sub-regexp visited, pop both levels from stack and compare their distances:
+                // if not equal, then set variable distance
+                uint32_t rdist = levels.back().dist_to_end;
+                levels.pop_back();
+                uint32_t ldist = levels.back().dist_to_end;
+                levels.pop_back();
+
+                Level& l = levels.back();
+                uint32_t dist = ldist == rdist ? ldist : VARDIST;
+
+                l.dist_to_end = l.dist_to_end == VARDIST || dist == VARDIST
+                        ? VARDIST : l.dist_to_end + dist;
+                l.dist_to_tag = l.dist_to_tag == VARDIST || dist == VARDIST
+                        ? VARDIST : l.dist_to_tag + dist;
             }
-            else if (i.succ == 1) {
-                // save the current distance on stack (from the left sub-RE to
-                // base), reset distance to the distance popped from stack (from
-                // the alternative end to base), recurse into the right sub-RE
-                StackItem k = {re, dist, 2, i.toplevel};
-                stack.push_back(k);
-                StackItem j = {re->alt.re2, VARDIST, 0, false};
-                stack.push_back(j);
-                dist = i.dist;
-            }
-            else {
-                // both sub-RE visited, compare the distance on stack (from the
-                // left sub-RE to base) to the current distance (from the right
-                // sub-RE to base), if not equal set variable distance
-                dist = (i.dist == dist) ? i.dist : VARDIST;
-            }
-        }
-        else if (re->type == RE::ITER) {
+        } else if (re->kind == Regexp::Kind::ITER) {
             if (i.succ == 0) {
-                // recurse into the sub-RE
-                StackItem k = {re, VARDIST, 1, i.toplevel};
-                stack.push_back(k);
-                StackItem j = {re->iter.re, VARDIST, 0, false};
-                stack.push_back(j);
+                // recurse into sub-regexp (leave the current regexp on stack)
+                stack.push_back({re, 1});
+                stack.push_back({re->iter.re, 0});
+
+                // increase level when descending into sub-regexp
+                levels.push_back({Tag::NONE, 0, 0});
+            } else {
+                // sub-regexp visited, pop level from stack: if it has fixed distance and repetition
+                // count is constant, resulting distance is fixed
+                uint32_t dist = levels.back().dist_to_end;
+                levels.pop_back();
+
+                Level& l = levels.back();
+                dist = dist == VARDIST || re->iter.max != re->iter.min
+                        ? VARDIST : dist * re->iter.max;
+
+                l.dist_to_end = l.dist_to_end == VARDIST || dist == VARDIST
+                        ? VARDIST : l.dist_to_end + dist;
+                l.dist_to_tag = l.dist_to_tag == VARDIST || dist == VARDIST
+                        ? VARDIST : l.dist_to_tag + dist;
             }
-            else {
-                // sub-RE visited, assume unknown number of iterations
-                // TODO: find precise distance for fixed repetition counter
-                dist = VARDIST;
-            }
-        }
-        else if (re->type == RE::CAT) {
-            // the right sub-RE is pushed on stack after the left sub-RE and
-            // visited earlier (because distance is computed from right to left)
-            StackItem j1 = {re->cat.re1, VARDIST, 0, i.toplevel};
-            stack.push_back(j1);
-            StackItem j2 = {re->cat.re2, VARDIST, 0, i.toplevel};
-            stack.push_back(j2);
-        }
-        else if (re->type == RE::TAG) {
-            // see note [fixed and variable tags]
-            Tag &tag = spec.tags[re->tag.idx];
+        } else if (re->kind == Regexp::Kind::CAT) {
+            // the right sub-regexp is pushed on stack after the left sub-regexp and visited earlier
+            // (because distance is computed from right to left)
+            stack.push_back({re->cat.re1, 0});
+            stack.push_back({re->cat.re2, 0});
+
+        } else if (re->kind == Regexp::Kind::TAG) {
+            Tag& tag = spec.tags[re->tag.idx];
+            Level& l = levels.back();
+            bool toplevel = levels.size() == 1;
+
+            // Don't check for orbit tags, as they will have VARDIST automatically.
             if (fictive(tag)) {
+                // fictive tags are marked as fixed to suppress code generation
                 tag.base = tag.dist = 0;
+            } else if (history(tag)) {
+                // fixed tags do not apply to m-tags
+            } else if (spec.opts->fixed_tags == FixedTags::NONE) {
+                // fixed tag optimization is globally disabled
+            } else if (spec.opts->tags_history) {
+                // Fixed tags with subhistories are possible in principle, but it ends up being too
+                // slow (handling special case adds overhead).
+            } else if (l.tag != Tag::NONE && l.dist_to_tag != VARDIST
+                    && (spec.opts->fixed_tags == FixedTags::ALL || toplevel)) {
+                // this tag can be fixed
+                tag.base = l.tag;
+                tag.dist = l.dist_to_tag;
+                tag.toplevel = toplevel;
+            } else {
+                // this tag cannot be fixed, make it the new base
+                l.tag = re->tag.idx;
+                l.dist_to_tag = 0;
             }
-            else if (i.toplevel && dist != VARDIST && !history(tag)) {
-                tag.base = base;
-                tag.dist = dist;
-            }
-            else if (i.toplevel) {
-                base = re->tag.idx;
-                dist = 0;
-            }
-            if (trailing(tag)) {
-                dist = 0;
-            }
+            // Trailing context is not special: tags are fixed on the rightmost cursor position, and
+            // trailing context is just another tag.
         }
     }
+
+    DCHECK(levels.size() == 1);
+    levels.pop_back();
 }
 
 } // anonymous namespace
 
-void find_fixed_tags(RESpec &spec)
-{
+void find_fixed_tags(RESpec& spec) {
     std::vector<StackItem> stack;
-    for (std::vector<RE*>::iterator i = spec.res.begin(); i != spec.res.end(); ++i) {
-        find_fixed_tags(spec, stack, *i);
+    std::vector<Level> levels;
+    for (Regexp* re : spec.res) {
+        find_fixed_tags(spec, stack, levels, re);
     }
 }
 

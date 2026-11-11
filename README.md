@@ -15,6 +15,10 @@ Another distinctive feature is its flexible interface: instead of assuming a
 fixed program template, re2php lets the programmer write most of the interface
 code and adapt the generated lexer to any particular environment.
 
+re2php is a fork of [re2c](https://re2c.org), which has a lot of examples.
+The fork tracks the upstream re2c code base and tries to remain as compatible
+with it as possible.
+
 
 DOCKER
 ------
@@ -38,6 +42,36 @@ docker run --rm -it -v "${PWD}:/src" -w /src davekok/re2php file.y.php -o file.p
 ```
 docker run --rm -it -v "%CD%:/src" -w /src davekok/re2php file.y.php -o file.php
 ```
+
+
+BUILD
+-----
+
+See BUILD.md or the [online docs](https://re2c.org/build/build.html) for
+instructions how to build re2c. The PHP backend is built as `re2php`.
+
+
+CONTRIBUTING
+------------
+
+re2php is an Open Source, community-driven project. See
+[CONTRIBUTING.md](https://github.com/skvadrik/re2c/blob/master/CONTRIBUTING.md)
+for details about contributions to the upstream re2c repository.
+
+
+FEEDBACK
+--------
+
+Bugtracker: https://github.com/davekok/re2php/issues
+
+Upstream re2c bugtracker: https://github.com/skvadrik/re2c/issues
+
+IRC channels:
+
+- irc.oftc.net/#re2c
+- irc.libera.chat/#re2c
+
+You are welcome to ask for help or share your thoughts and ideas.
 
 EXAMPLE
 -------
@@ -137,9 +171,6 @@ foreach ((new Lexer("843954,3948,30454")) as $offset => [$token, $value])
 TODO
 ----
 
-- Add support for multiple languages in re2c, and add php as one of them.
-- Add a `--lang=<lang>` option to set the language.
-- Support the hard links re2c and re2php, and automatically set the right language.
 - Since PHP does not have a character type. Use integers instead of strings in the output for PHP.
 - Add support for the common @-syntax style meta data in doccomments. So constants with associated meta data can be defined as: `/** @re [1-9][0-9]*; */ const NUMBER = 1;`. As an alternative to the `/*!re2c NUMBER = [1-9][0-9]*; */ const NUMBER = 1;` style.
 - Add support for always returning at the end of an action. As it is unlikely the code should continue when an action has ended (for at least PHP).
@@ -150,7 +181,7 @@ BUGS
 Please report any bugs and send feature requests to https://github.com/davekok/re2php/issues.
 
 - Setting types has no effect, but options should not be there for PHP.
-- Setting YYBUFFER currently does not work.
+- Setting YYINPUT does not change the default YYPEEK expression; set YYPEEK as well when using a custom buffer.
 
 
 AUTHORS

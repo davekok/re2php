@@ -1,536 +1,185 @@
-#ifndef _RE2C_CODE_OUTPUT_
-#define _RE2C_CODE_OUTPUT_
+#ifndef _RE2C_CODEGEN_OUTPUT_
+#define _RE2C_CODEGEN_OUTPUT_
 
-#include <stddef.h>
-#include "src/util/c99_stdint.h"
-#include <string.h>
-#include <fstream>
+#include <stdint.h>
 #include <set>
 #include <string>
 #include <sstream>
 #include <vector>
+#include <map>
+#include <memory>
 
-#include "src/codegen/label.h"
-#include "src/debug/debug.h"
+#include "src/constants.h"
+#include "src/codegen/code.h"
+#include "src/dfa/tcmd.h"
 #include "src/msg/location.h"
-#include "src/util/counter.h"
-#include "src/util/forbid_copy.h"
-#include "src/util/slab_allocator.h"
-#include "src/util/uniq_vector.h"
-
+#include "src/options/opt.h"
+#include "src/util/allocator.h"
+#include "src/util/attribute.h"
 
 namespace re2c {
 
+// forward decls
 class Msg;
+struct Adfa;
 struct Opt;
 struct opt_t;
-template <typename value_t> class uniq_vector_t;
-
-// need 8-byte alignment to allocate structs with pointers and 64-bit integers
-typedef slab_allocator_t<1024 * 1024, 8> code_alc_t;
+struct OutputBlock;
+struct State;
+using Adfas = std::vector<std::unique_ptr<Adfa>>;
 
 class Scratchbuf {
-    code_alc_t &alc;
+    OutAllocator& alc;
     std::ostringstream os;
 
-public:
-    explicit Scratchbuf(code_alc_t &alc): alc(alc), os() {}
+  public:
+    explicit Scratchbuf(OutAllocator& alc): alc(alc), os() {}
     bool empty() const { return os.str().empty(); }
-    std::ostringstream &stream() { return os; }
-    const char *flush();
+    std::ostringstream& stream() { return os; }
+    Scratchbuf& i32(int32_t u) { os << u; return *this; }
     Scratchbuf& u32(uint32_t u) { os << u; return *this; }
     Scratchbuf& u64(uint64_t u) { os << u; return *this; }
-    Scratchbuf& str(const std::string &s) { os << s; return *this; }
-    Scratchbuf& cstr(const char *s) { os << s; return *this; }
-    Scratchbuf& label(const label_t &l) { os << l; return *this; }
-    Scratchbuf& u32_hex(uint32_t u, const opt_t *opts);
-    Scratchbuf& u32_width(uint32_t u, int width);
+    Scratchbuf& str(const std::string& s) { os << s; return *this; }
+    Scratchbuf& cstr(const char* s) { os << s; return *this; }
+    Scratchbuf& label(const std::string& s) { os << s; return *this; }
+    Scratchbuf& label(uint32_t u) { os << u; return *this; }
+    Scratchbuf& exact_uint(size_t width);
+    const char* flush();
+
+    Scratchbuf& unchecked_label(const Label& l);
+    Scratchbuf& label(const Label& l);
 };
 
-// forward decls
-struct CodeStmt;
-struct CodeCase;
-
-typedef const char *CodeText;
-
-struct CodeStmts {
-    CodeStmt *head;
-    CodeStmt **ptail;
-};
-
-struct CodeIfTE {
-    CodeText   if_cond;
-    CodeText   else_cond;
-    CodeStmts *if_code;
-    CodeStmts *else_code;
-    bool       oneline;
-};
-
-struct CodeCase {
-    enum Kind {
-        CHARS,
-        NUMBER,
-        STRING,
-        DEFAULT
-    } kind;
-
-    struct Chars {
-        size_t     nranges;
-        uint32_t  *ranges;
-    };
-
-    union {
-        Chars       chars;
-        int32_t     number;
-        const char *string;
-    };
-    CodeStmts *body;
-    CodeCase  *next;
-};
-
-struct CodeCases {
-    CodeCase  *head;
-    CodeCase **ptail;
-};
-
-struct CodeSwitch {
-    CodeText   expr;
-    CodeCases *cases;
-    bool       impdef;
-};
-
-struct CodeBlock {
-    enum Fmt {
-        WRAPPED,
-        INDENTED,
-        RAW
-    };
-
-    CodeStmts *stmts;
-    Fmt        fmt;
-};
-
-struct CodeVar {
-    const char *type;
-    const char *name;
-    const char *init;
-};
-
-struct CodeTags {
-    const char *fmt;
-    const char *sep;
-};
-
-struct CodeRaw {
-    const char *data;
-    size_t      size;
-};
-
-struct CodeStmt {
-    enum Kind {
-        EMPTY,
-        IF_THEN_ELSE,
-        SWITCH,
-        BLOCK,
-        SKIP,
-        PEEK,
-        BACKUP,
-        PEEK_SKIP,
-        SKIP_PEEK,
-        SKIP_BACKUP,
-        BACKUP_SKIP,
-        BACKUP_PEEK,
-        BACKUP_PEEK_SKIP,
-        SKIP_BACKUP_PEEK,
-        LINE_INFO_INPUT,
-        LINE_INFO_OUTPUT,
-        COND_ENUM,
-        COND_GOTO,
-        COND_TABLE,
-        STATE_GOTO,
-        STAGS,
-        MTAGS,
-        YYMAXFILL,
-        YYMAXNMATCH,
-        YYCH,
-        YYACCEPT,
-        VAR,
-        TEXT,
-        TEXT_RAW,
-        VERBATIM,
-        RAW
-    } kind;
-
-    union {
-        CodeIfTE   ifte;
-        CodeSwitch swch;
-        CodeBlock  block;
-        CodeText   text;
-        CodeRaw    raw;
-        CodeVar    var;
-        CodeTags   tags;
-        loc_t      loc;
-    };
-
-    CodeStmt *next;
-};
-
-inline CodeStmt *code_stmt(code_alc_t &alc, CodeStmt::Kind kind)
-{
-    CodeStmt *s = alc.alloct<CodeStmt>(1);
-    s->kind = kind;
-    s->next = NULL;
-    return s;
-}
-
-inline CodeStmt *code_stmt_text(code_alc_t &alc, CodeText text)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::TEXT);
-    s->text = text;
-    return s;
-}
-
-inline CodeStmt *code_verbatim(code_alc_t &alc, CodeText text)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::VERBATIM);
-    s->text = text;
-    return s;
-}
-
-inline CodeStmt *code_raw(code_alc_t &alc, const char *data, size_t size)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::RAW);
-    char *copy = alc.alloct<char>(size);
-    memcpy(copy, data, size);
-    s->raw.size = size;
-    s->raw.data = copy;
-    return s;
-}
-
-inline CodeStmt *code_stmt_textraw(code_alc_t &alc, CodeText text)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::TEXT_RAW);
-    s->text = text;
-    return s;
-}
-
-inline CodeStmt *code_tags(code_alc_t &alc,
-    const std::string &fmt, const std::string &sep, bool mtags)
-{
-    CodeStmt *s = code_stmt(alc, mtags ? CodeStmt::MTAGS : CodeStmt::STAGS);
-
-    char *fmt_copy = alc.alloct<char>(fmt.length() + 1);
-    strcpy(fmt_copy, fmt.c_str());
-    s->tags.fmt = fmt_copy;
-
-    char *sep_copy = alc.alloct<char>(sep.length() + 1);
-    strcpy(sep_copy, sep.c_str());
-    s->tags.sep = sep_copy;
-
-    return s;
-}
-
-inline CodeStmt *code_yymaxfill(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::YYMAXFILL);
-}
-
-inline CodeStmt *code_yymaxnmatch(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::YYMAXNMATCH);
-}
-
-inline CodeStmt *code_cond_enum(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::COND_ENUM);
-}
-
-inline CodeStmt *code_cond_table(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::COND_TABLE);
-}
-
-inline CodeStmt *code_cond_goto(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::COND_GOTO);
-}
-
-inline CodeStmt *code_state_goto(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::STATE_GOTO);
-}
-
-inline CodeStmt *code_line_info_input(code_alc_t &alc, const loc_t &loc)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::LINE_INFO_INPUT);
-    s->loc = loc;
-    return s;
-}
-
-inline CodeStmt *code_yych_decl(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::YYCH);
-}
-
-inline CodeStmt *code_yyaccept_def(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::YYACCEPT);
-}
-
-inline CodeStmt *code_line_info_output(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::LINE_INFO_OUTPUT);
-}
-
-inline CodeStmt *code_stmt_skip(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::SKIP);
-}
-
-inline CodeStmt *code_stmt_peek(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::PEEK);
-}
-
-inline CodeStmt *code_stmt_backup(code_alc_t &alc)
-{
-    return code_stmt(alc, CodeStmt::BACKUP);
-}
-
-inline CodeStmt *code_block(code_alc_t &alc, CodeStmts *stmts, CodeBlock::Fmt fmt)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::BLOCK);
-    s->block.stmts = stmts;
-    s->block.fmt   = fmt;
-    return s;
-}
-
-inline CodeStmt *code_stmt_if_then_else(code_alc_t &alc, CodeText if_cond,
-    CodeStmts *if_code, CodeStmts *else_code, bool oneline = true)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::IF_THEN_ELSE);
-    s->ifte.if_cond   = if_cond;
-    s->ifte.else_cond = NULL;
-    s->ifte.if_code   = if_code;
-    s->ifte.else_code = else_code;
-    s->ifte.oneline   = oneline;
-    return s;
-}
-
-inline CodeStmt *code_stmt_if_then_elif(code_alc_t &alc, CodeText if_cond,
-    CodeStmts *if_code, CodeText else_cond, CodeStmts *else_code)
-{
-    CodeStmt *s = code_stmt_if_then_else(alc, if_cond, if_code, else_code, false);
-    s->ifte.else_cond = else_cond;
-    return s;
-}
-
-inline CodeCase *code_case_default(code_alc_t &alc, CodeStmts *body)
-{
-    CodeCase *s = alc.alloct<CodeCase>(1);
-    s->kind = CodeCase::DEFAULT;
-    s->body = body;
-    s->next = NULL;
-    return s;
-}
-
-inline CodeCase *code_case_number(code_alc_t &alc, CodeStmts *body, int32_t number)
-{
-    CodeCase *s = alc.alloct<CodeCase>(1);
-    s->kind = CodeCase::NUMBER;
-    s->number = number;
-    s->body = body;
-    s->next = NULL;
-    return s;
-}
-
-inline CodeCase *code_case_string(code_alc_t &alc, CodeStmts *body, const char *string)
-{
-    CodeCase *s = alc.alloct<CodeCase>(1);
-    s->kind = CodeCase::STRING;
-    s->string = string;
-    s->body = body;
-    s->next = NULL;
-    return s;
-}
-
-inline CodeCase *code_case_chars(code_alc_t &alc, CodeStmts *body,
-    const std::vector<std::pair<uint32_t, uint32_t> > &ranges)
-{
-    CodeCase *s = alc.alloct<CodeCase>(1);
-    s->kind = CodeCase::CHARS;
-
-    const size_t n = ranges.size();
-    uint32_t *rs = alc.alloct<uint32_t>(2 * n);
-    for (uint32_t i = 0; i < n; ++i) {
-        rs[2 * i]     = ranges[i].first;
-        rs[2 * i + 1] = ranges[i].second;
-    }
-    s->chars.nranges = n;
-    s->chars.ranges  = rs;
-
-    s->body = body;
-    s->next = NULL;
-    return s;
-}
-
-inline CodeCases *code_cases(code_alc_t &alc)
-{
-    CodeCases *c = alc.alloct<CodeCases>(1);
-    c->head  = NULL;
-    c->ptail = &c->head;
-    return c;
-}
-
-inline void append_case(CodeCases *cases, CodeCase *ccase)
-{
-    DASSERT(ccase);
-    *cases->ptail = ccase;
-    cases->ptail  = &ccase->next;
-}
-
-inline CodeStmt *code_switch(code_alc_t &alc, CodeText expr, CodeCases *cases,
-    bool impdef)
-{
-    CodeStmt *s = code_stmt(alc, CodeStmt::SWITCH);
-    s->swch.expr   = expr;
-    s->swch.cases  = cases;
-    s->swch.impdef = impdef;
-    return s;
-}
-
-inline CodeStmts *code_stmts(code_alc_t &alc)
-{
-    CodeStmts *s = alc.alloct<CodeStmts>(1);
-    s->head = NULL;
-    s->ptail = &s->head;
-    return s;
-}
-
-inline void append_stmt(CodeStmts *stmts, CodeStmt *stmt)
-{
-    DASSERT(stmt);
-    *stmts->ptail = stmt;
-    stmts->ptail = &stmt->next;
-}
-
-inline void prepend_stmt(CodeStmts *stmts, CodeStmt *stmt)
-{
-    DASSERT(stmt);
-    stmt->next = stmts->head;
-    stmts->head = stmt;
-}
-
-inline void append_stmts(CodeStmts *stmts1, CodeStmts *stmts2)
-{
-    if (stmts2 && stmts2->head) {
-        *stmts1->ptail = stmts2->head;
-        for (; *(stmts1->ptail); stmts1->ptail = &(*stmts1->ptail)->next);
-    }
-}
-
-struct CodegenContext {
-    code_alc_t &allocator;
-    Scratchbuf &scratchbuf;
-    const opt_t *globopts;
-    const opt_t *opts;
-    Msg &msg;
-    const loc_t &loc;
-    const uniq_vector_t<std::string> &allcondnames;
-    const std::set<std::string> &allstags;
-    const std::set<std::string> &allmtags;
-    const std::vector<std::string> &condnames;
-    const size_t maxfill;
-    const size_t maxnmatch;
-    const uint32_t fillidx;
-    const bool used_yyaccept;
-    const bool warn_cond_ord;
-};
+using blocks_t = std::vector<OutputBlock*>;
+using blocks_citer_t = blocks_t::const_iterator;
+using tagnames_t = std::set<std::string>;
 
 struct RenderContext {
-    std::ostringstream &os;
-    const opt_t *opts;
-    const Msg &msg;
+    std::ostringstream os;
+    const Msg& msg;
+    const opt_t* opts;
+    const std::string& file;
+    uint32_t line;
     uint32_t ind;
-    const char *file;
-    uint32_t &line;
+    bool oneline_mode;
+
+    RenderContext(const Msg& msg, const std::string& file)
+        : os(), msg(msg), opts(nullptr), file(file), line(1), ind(0), oneline_mode(false) {}
+    FORBID_COPY(RenderContext);
 };
 
-void gen_tags(Scratchbuf &o, CodeStmt *code, const std::set<std::string> &tags);
-void combine_stmt(CodegenContext &ctx, CodeStmt *code);
-void combine_stmts(CodegenContext &ctx, CodeStmts *stmts);
-void render_code_stmt(RenderContext &rctx, const CodeStmt *code);
-void render_code_stmts(RenderContext &rctx, const CodeStmts *code);
-void render_code_if_then_else(RenderContext &rctx, const CodeIfTE *code);
-void render_code_case(RenderContext &rctx, const CodeCase *code, bool defcase,
-    bool noindent);
-void render_code_switch(RenderContext &rctx, const CodeSwitch *code);
-void render_code_block(RenderContext &rctx, const CodeBlock *code);
-
-struct OutputFragment {
-    CodeStmt *stmt;
-    uint32_t  indent;
+class RenderCallback {
+  public:
+    virtual void render_var(StxVarId var);
+    virtual size_t get_list_size(StxVarId var) const;
+    virtual void start_list(StxVarId var, size_t lbound, size_t rbound);
+    virtual bool next_in_list(StxVarId var);
+    virtual bool eval_cond(StxLOpt opt);
+    virtual ~RenderCallback() = default;
 };
+
+struct StartCond {
+    std::string name;
+    uint32_t number;
+};
+using StartConds = std::vector<StartCond>;
+
+using storable_states_t = std::map<uint32_t, CodeList*>;
 
 struct OutputBlock {
+    InputBlock kind;
+    std::string name;
     const loc_t loc;
-    std::vector<OutputFragment> fragments;
+    CodeList* code;
     bool used_yyaccept;
     bool have_user_code;
-    std::vector<std::string> types;
-    std::set<std::string> stags;
-    std::set<std::string> mtags;
-    const opt_t *opts;
+    StartConds conds;
+    tagnames_t stags;
+    tagnames_t mtags;
+    tagnames_t svars;
+    tagnames_t mvars;
+    const opt_t* opts;
+    Adfas dfas;
 
-    explicit OutputBlock(const loc_t &loc);
+    size_t max_fill;   // YYMAXFILL
+    size_t max_nmatch; // YYMAXNMATCH
+
+    // Used in the state switch (with `-f --storable-state` option).
+    Label* start_label;          // start label of this block
+    storable_states_t fill_goto; // transitions to YYFILL states
+
+    // precomputed YYFN parts with block-level options (in rec/func mode)
+    CodeFnCommon* fn_common;
+    // precomputed relational operators
+    const char* binops[OP_COUNT];
+
+    OutputBlock(InputBlock kind, const std::string& name, const loc_t& loc);
     ~OutputBlock();
     FORBID_COPY(OutputBlock);
 };
 
-typedef std::vector<OutputBlock *> blocks_t;
-typedef blocks_t::const_iterator blocks_citer_t;
-
-class Output {
-    blocks_t cblocks; /* .c file */
-    blocks_t hblocks; /* .h file */
-    blocks_t *pblocks; /* selector */
-
-public:
-    counter_t<label_t> label_counter;
-    uint32_t fill_index;
+struct Output {
+    OutAllocator& allocator;
+    Msg& msg;
+    blocks_t cblocks;  // .c file
+    blocks_t hblocks;  // .h file
+    blocks_t* pblocks; // selector
+    blocks_t tmpblocks;
+    uint32_t label_counter;
+    uint32_t fill_label_counter;
     bool state_goto;
-    bool cond_enum_in_hdr;
-    bool cond_goto;
+    bool cond_enum_autogen; // true unless an explicit `conditions` block is used
     bool warn_condition_order;
     bool need_header;
-    Msg &msg;
+    bool done_mtag_defs;
     std::set<std::string> skeletons;
-    size_t max_fill;
-    size_t max_nmatch;
-    code_alc_t allocator;
     Scratchbuf scratchbuf;
+    OutputBlock* current_block;
 
-    explicit Output(Msg &msg);
+    // whole-program options accumulated for all non-reuse blocks
+    const opt_t* total_opts;
+
+    // precomputed YYFN parts with whole-program options (in rec/func mode)
+    CodeFnCommon* fn_common;
+
+    Output(OutAllocator& alc, Msg& msg);
     ~Output();
-    OutputBlock &block();
-    size_t blockid() const;
-    bool open ();
-    void new_block(Opt &opts, const loc_t &loc);
+    OutputBlock& block();
+    void set_current_block(OutputBlock* block);
+    bool open();
+    Ret new_block(Opt& opts, InputBlock kind, std::string name, const loc_t& loc) NODISCARD;
     void header_mode(bool on);
     bool in_header() const;
-    void wraw (const char *s, const char *e);
-    void wversion_time ();
-    void wdelay_stmt(uint32_t ind, CodeStmt *stmt);
-    bool emit();
-    bool emit_blocks(const std::string &fname, blocks_t &blocks,
-        const uniq_vector_t<std::string> &global_types,
-        const std::set<std::string> &global_stags,
-        const std::set<std::string> &global_mtags);
-    FORBID_COPY (Output);
+    void gen_raw(const uint8_t* s, const uint8_t* e, bool newline = false);
+    void gen_stmt(Code* stmt);
+    Ret gen_prolog(Opt& opts, const loc_t& loc);
+    void gen_epilog();
+    FORBID_COPY(Output);
 };
 
-void output_version_time(std::ostream &o, bool version, bool date);
+void init_go(CodeGo* go);
+bool endstate(const State* s);
+bool consume(const State* s);
+State* fallback_for_state(const Adfa& dfa, const State* state, tcid_t* ptags);
+std::string bitmap_name(const opt_t* opts, const std::string& cond);
+CodeList* gen_bitmap(Output& output, const CodeBitmap* bitmap, const std::string& cond);
+void gen_tags(Scratchbuf& buf, const opt_t* opts, Code* code, const tagnames_t& tags);
+CodeList* gen_goto_after_fill(
+        Output& output, const Adfa& dfa, const State* from, const CodeJump* jump);
+void gen_dfa_as_blocks_with_labels(Output& output, const Adfa& dfa, CodeList* stmts);
+void gen_dfa_as_switch_cases(Output& output, Adfa& dfa, CodeCases* cases);
+void wrap_dfas_in_loop_switch(Output& output, CodeList* stmts, CodeCases* cases);
+void expand_fintags(Output& output, const Tag& tag, std::vector<const char*>& fintags);
+std::string captvar_name(size_t index, const opt_t* opts);
+std::string vartag_name(tagver_t ver, const opt_t* opts, bool is_mtag);
+std::string vartag_expr(tagver_t ver, const opt_t* opts, bool is_mtag);
+void gen_peek_expr(std::ostream& os, const opt_t* opts);
+
+Ret codegen_analyze(Output& output) NODISCARD;
+Ret codegen_generate(Output& output) NODISCARD;
+void codegen_fixup(Output& output);
+Ret codegen_render(Output& outptu) NODISCARD;
 
 } // namespace re2c
 
-#endif // _RE2C_CODE_OUTPUT_
+#endif // _RE2C_CODEGEN_OUTPUT_
